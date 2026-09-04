@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+assets/*
+!assets/.gitkeep
+!assets/fonts/
+!assets/fonts/**
+*.log
+.DS_Store
+
+# macOS 시스템 폰트 — 코드 미참조 + 재배포 라이선스 문제 (53MB)
+assets/AppleSDGothicNeo.ttc

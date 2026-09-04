@@ -1,0 +1,323 @@
+import { access, mkdir } from "node:fs/promises";
+import sharp from "sharp";
+import { chromium, type BrowserContext, type Locator, type Page } from "playwright-core";
+import type { AppConfig } from "../config.js";
+import { AppError } from "../errors.js";
+import type { PathGuard } from "../security/paths.js";
+
+const CHATGPT_URL = "https://chatgpt.com/";
+
+export interface ChatGptUiGenerationRequest {
+  requestId: string;
+  prompt: string;
+  attachments: string[];
+  outputPath: string;
+  exactCopy: string[];
+}
+
+export interface ChatGptUiQaResult {
+  exact_text: boolean;
+  no_people: boolean;
+  errors: string[];
+  source: "chatgpt_visual_self_review";
+}
+
+export interface ChatGptUiGenerationResult {
+  output_path: string;
+  attempts: number;
+  qa: ChatGptUiQaResult;
+}
+
+export interface ChatGptUiStatus {
+  ready: boolean;
+  login_required: boolean;
+  url: string;
+  profile_dir: string;
+}
+
+export interface ChatGptUiDriver {
+  setup(waitForLoginMs?: number): Promise<ChatGptUiStatus>;
+  generate(request: ChatGptUiGenerationRequest): Promise<ChatGptUiGenerationResult>;
+}
+
+const composerSelectors = [
+  "#prompt-textarea",
+  "div[contenteditable='true'][data-virtualkeyboard='true']",
+  "div.ProseMirror[contenteditable='true']",
+  "textarea[placeholder*='Message']",
+  "textarea[placeholder*='메시지']",
+];
+
+const sendSelectors = [
+  "button[data-testid='send-button']",
+  "button[aria-label='Send prompt']",
+  "button[aria-label*='Send']",
+  "button[aria-label*='보내기']",
+];
+
+const attachSelectors = [
+  "button[data-testid='composer-plus-btn']",
+  "button[aria-label*='Attach']",
+  "button[aria-label*='Upload']",
+  "button[aria-label*='첨부']",
+  "button[aria-label*='파일']",
+];
+
+const stopSelectors = [
+  "button[data-testid='stop-button']",
+  "button[aria-label*='Stop']",
+  "button[aria-label*='중지']",
+];
+
+async function firstVisible(page: Page, selectors: string[]): Promise<Locator | undefined> {
+  for (const selector of selectors) {
+    const candidates = page.locator(selector);
+    const count = await candidates.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const candidate = candidates.nth(index);
+      if (await candidate.isVisible().catch(() => false)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function waitForComposer(page: Page, timeoutMs: number): Promise<Locator | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const composer = await firstVisible(page, composerSelectors);
+    if (composer) return composer;
+    await page.waitForTimeout(500);
+  }
+  return undefined;
+}
+
+async function largeImageSources(page: Page): Promise<string[]> {
+  return page.locator("img").evaluateAll((images) => images
+    .map((image) => image as HTMLImageElement)
+    .filter((image) => image.naturalWidth >= 512 && image.naturalHeight >= 512)
+    .map((image) => image.currentSrc || image.src)
+    .filter(Boolean));
+}
+
+function parseQa(text: string): ChatGptUiQaResult | undefined {
+  const marker = text.lastIndexOf("QA_JSON");
+  if (marker < 0) return undefined;
+  const tail = text.slice(marker);
+  const start = tail.indexOf("{");
+  const end = tail.lastIndexOf("}");
+  if (start < 0 || end <= start) return undefined;
+  try {
+    const parsed = JSON.parse(tail.slice(start, end + 1)) as Record<string, unknown>;
+    if (typeof parsed.exact_text !== "boolean" || typeof parsed.no_people !== "boolean") return undefined;
+    return {
+      exact_text: parsed.exact_text,
+      no_people: parsed.no_people,
+      errors: Array.isArray(parsed.errors) ? parsed.errors.filter((item): item is string => typeof item === "string") : [],
+      source: "chatgpt_visual_self_review",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export class PlaywrightChatGptUiDriver implements ChatGptUiDriver {
+  private context?: BrowserContext;
+
+  constructor(private readonly config: AppConfig, private readonly guard: PathGuard) {}
+
+  private async browserContext(): Promise<BrowserContext> {
+    if (this.context) return this.context;
+    try {
+      await access(this.config.chatGptChromeExecutable);
+    } catch {
+      throw new AppError("CHATGPT_UI_NOT_READY", `Google Chrome 실행 파일을 찾을 수 없습니다: ${this.config.chatGptChromeExecutable}`);
+    }
+    const profileMarker = await this.guard.writable(`${this.config.chatGptUiProfileDir}/profile.json`, ".json");
+    await mkdir(this.config.chatGptUiProfileDir, { recursive: true });
+    this.context = await chromium.launchPersistentContext(this.config.chatGptUiProfileDir, {
+      executablePath: this.config.chatGptChromeExecutable,
+      headless: false,
+      viewport: null,
+      acceptDownloads: true,
+      args: ["--no-first-run", "--disable-default-apps", "--disable-background-networking"],
+    }).catch((error: unknown) => {
+      throw new AppError("CHATGPT_UI_NOT_READY", `ChatGPT 자동화용 Chrome을 시작하지 못했습니다: ${error instanceof Error ? error.message : "unknown"}`);
+    });
+    void profileMarker;
+    this.context.on("close", () => { this.context = undefined; });
+    return this.context;
+  }
+
+  private async page(): Promise<Page> {
+    const context = await this.browserContext();
+    const existing = context.pages().find((page) => page.url().startsWith(CHATGPT_URL));
+    const page = existing ?? await context.newPage();
+    page.setDefaultTimeout(15_000);
+    await page.bringToFront();
+    if (!page.url().startsWith(CHATGPT_URL)) await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    return page;
+  }
+
+  async setup(waitForLoginMs = 0): Promise<ChatGptUiStatus> {
+    const page = await this.page();
+    const composer = await waitForComposer(page, Math.max(3_000, waitForLoginMs));
+    return {
+      ready: Boolean(composer),
+      login_required: !composer,
+      url: page.url(),
+      profile_dir: this.config.chatGptUiProfileDir,
+    };
+  }
+
+  private async ensureReadyPage(): Promise<Page> {
+    const page = await this.page();
+    await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    const composer = await waitForComposer(page, 20_000);
+    if (!composer) {
+      throw new AppError(
+        "CHATGPT_LOGIN_REQUIRED",
+        "자동화용 Chrome에서 ChatGPT 로그인이 필요합니다. setup_chatgpt_ui를 호출해 열린 창에서 한 번 로그인한 뒤 다시 실행하세요.",
+        true,
+        "chatgpt_login",
+      );
+    }
+    return page;
+  }
+
+  private async uploadAttachments(page: Page, attachments: string[]): Promise<void> {
+    if (attachments.length === 0) return;
+    for (const attachment of attachments) await this.guard.inputImage(attachment, ["assets"]);
+    let fileInput = page.locator("input[type='file']").last();
+    if (await fileInput.count() === 0) {
+      const attach = await firstVisible(page, attachSelectors);
+      if (!attach) throw new AppError("CHATGPT_UI_CHANGED", "ChatGPT의 파일 첨부 버튼을 찾지 못했습니다. UI 선택자 업데이트가 필요합니다.", true, "attach_reference");
+      await attach.click();
+      fileInput = page.locator("input[type='file']").last();
+      await fileInput.waitFor({ state: "attached", timeout: 10_000 }).catch(() => undefined);
+    }
+    if (await fileInput.count() === 0) throw new AppError("CHATGPT_UI_CHANGED", "ChatGPT의 파일 입력 요소를 찾지 못했습니다.", true, "attach_reference");
+    await fileInput.setInputFiles(attachments);
+    await page.waitForTimeout(1_000);
+  }
+
+  private async submit(page: Page, text: string): Promise<void> {
+    const composer = await waitForComposer(page, 10_000);
+    if (!composer) throw new AppError("CHATGPT_UI_CHANGED", "ChatGPT 메시지 입력창을 찾지 못했습니다.", true, "enter_prompt");
+    await composer.click();
+    await composer.fill(text);
+    const send = await firstVisible(page, sendSelectors);
+    if (send && await send.isEnabled().catch(() => false)) await send.click();
+    else await composer.press("Enter");
+  }
+
+  private async waitForNewImage(page: Page, before: string[]): Promise<Locator> {
+    await page.waitForFunction((known) => Array.from(document.images).some((image) => {
+      const src = image.currentSrc || image.src;
+      return image.naturalWidth >= 512 && image.naturalHeight >= 512 && src.length > 0 && !known.includes(src);
+    }), before, { timeout: this.config.chatGptUiTimeoutMs, polling: 1_000 }).catch(() => {
+      throw new AppError("CHATGPT_GENERATION_FAILED", "ChatGPT 이미지 생성이 제한 시간 안에 완료되지 않았습니다.", true, "wait_for_image");
+    });
+    await page.waitForTimeout(3_000);
+    const candidates = page.locator("img");
+    for (let index = await candidates.count() - 1; index >= 0; index -= 1) {
+      const candidate = candidates.nth(index);
+      const properties = await candidate.evaluate((element) => {
+        const image = element as HTMLImageElement;
+        return { src: image.currentSrc || image.src, width: image.naturalWidth, height: image.naturalHeight };
+      }).catch(() => ({ src: "", width: 0, height: 0 }));
+      if (properties.width >= 512 && properties.height >= 512 && properties.src && !before.includes(properties.src)) return candidate;
+    }
+    throw new AppError("CHATGPT_GENERATION_FAILED", "생성 완료된 ChatGPT 이미지를 찾지 못했습니다.", true, "locate_image");
+  }
+
+  private async waitForIdle(page: Page): Promise<void> {
+    const deadline = Date.now() + this.config.chatGptUiTimeoutMs;
+    while (Date.now() < deadline) {
+      const stop = await firstVisible(page, stopSelectors);
+      if (!stop) return;
+      await page.waitForTimeout(1_000);
+    }
+    throw new AppError("CHATGPT_GENERATION_FAILED", "ChatGPT 응답이 제한 시간 안에 완료되지 않았습니다.", true, "wait_for_idle");
+  }
+
+  private async saveImage(image: Locator, outputPath: string): Promise<string> {
+    const output = await this.guard.writable(outputPath);
+    const dataUrl = await image.evaluate(async (element) => {
+      const image = element as HTMLImageElement;
+      const response = await fetch(image.currentSrc || image.src);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+    }).catch((error: unknown) => {
+      throw new AppError("DOWNLOAD_FAILED", `ChatGPT 생성 이미지를 읽지 못했습니다: ${error instanceof Error ? error.message : "unknown"}`, true, "download_generated_image");
+    });
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) throw new AppError("DOWNLOAD_FAILED", "ChatGPT 이미지 데이터 형식이 올바르지 않습니다.", true, "download_generated_image");
+    const buffer = Buffer.from(dataUrl.slice(comma + 1), "base64");
+    if (buffer.length > this.config.maxDownloadBytes) throw new AppError("IMAGE_TOO_LARGE", "ChatGPT 생성 이미지가 다운로드 크기 제한을 초과했습니다.");
+    await sharp(buffer).png({ compressionLevel: 9 }).toFile(output);
+    return output;
+  }
+
+  private async selfReview(page: Page, exactCopy: string[]): Promise<ChatGptUiQaResult> {
+    const messages = page.locator("[data-message-author-role='assistant']");
+    const before = await messages.count();
+    const prompt = [
+      "방금 생성한 이미지 자체를 확대해서 엄격히 검사하세요.",
+      `이미지 안의 필수 문구: ${exactCopy.map((copy) => `“${copy}”`).join(", ")}`,
+      "각 문구의 한글, 숫자, 영문, 띄어쓰기가 정확한지 확인하세요.",
+      "또한 사람, 선수, 얼굴, 손, 신체 또는 사람 실루엣이 이미지 안에 생성되었는지 확인하세요.",
+      "설명 없이 반드시 아래 한 줄 형식으로만 답하세요.",
+      "QA_JSON: {\"exact_text\":true,\"no_people\":true,\"errors\":[]}",
+    ].join("\n");
+    await this.submit(page, prompt);
+    await page.waitForFunction((count) => document.querySelectorAll("[data-message-author-role='assistant']").length > count, before, {
+      timeout: 90_000,
+      polling: 500,
+    }).catch(() => {
+      throw new AppError("CHATGPT_GENERATION_FAILED", "ChatGPT 이미지 자체 검수 응답을 받지 못했습니다.", true, "visual_self_review");
+    });
+    const last = messages.last();
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      const qa = parseQa(await last.innerText().catch(() => ""));
+      if (qa) return qa;
+      await page.waitForTimeout(500);
+    }
+    throw new AppError("CHATGPT_UI_CHANGED", "ChatGPT 검수 JSON을 해석하지 못했습니다.", true, "visual_self_review");
+  }
+
+  async generate(request: ChatGptUiGenerationRequest): Promise<ChatGptUiGenerationResult> {
+    const page = await this.ensureReadyPage();
+    await this.uploadAttachments(page, request.attachments);
+    let correction = "";
+    let lastQa: ChatGptUiQaResult = { exact_text: false, no_people: false, errors: ["not generated"], source: "chatgpt_visual_self_review" };
+    for (let attempt = 1; attempt <= this.config.chatGptUiRetries + 1; attempt += 1) {
+      const before = await largeImageSources(page);
+      await this.submit(page, attempt === 1 ? request.prompt : correction);
+      const generatedImage = await this.waitForNewImage(page, before);
+      await this.waitForIdle(page);
+      await this.saveImage(generatedImage, request.outputPath);
+      lastQa = await this.selfReview(page, request.exactCopy);
+      if (lastQa.exact_text && lastQa.no_people) return { output_path: request.outputPath, attempts: attempt, qa: lastQa };
+      correction = [
+        "방금 검수에서 문제가 발견됐습니다. 같은 카드 디자인을 오류만 수정해 새 이미지로 다시 생성하세요.",
+        `오류: ${lastQa.errors.join("; ") || "필수 문구 또는 사람 미생성 조건 불일치"}`,
+        `반드시 정확히 유지할 문구: ${request.exactCopy.map((copy) => `“${copy}”`).join(", ")}`,
+        "사람, 선수, 얼굴, 손, 신체, 사람 실루엣은 절대 생성하지 마세요.",
+        "최종 이미지 한 장만 반환하세요.",
+      ].join("\n");
+    }
+    throw new AppError(
+      "CHATGPT_GENERATION_FAILED",
+      `${request.requestId}: 자동 검수 재시도 후에도 통과하지 못했습니다. ${lastQa.errors.join("; ")}`,
+      true,
+      "visual_self_review",
+    );
+  }
+}
